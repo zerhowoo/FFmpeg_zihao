@@ -121,87 +121,73 @@ def calculate_auto_trim(duration):
 
 
 # ============================================================
-# TTS 语音合成 (Qwen/DashScope)
+# TTS 语音合成 (Qwen3-TTS 本地模型)
 # ============================================================
 
-def generate_tts_qwen(text, output_audio_path):
+def generate_tts_qwen(text, output_audio_path, model_path="Qwen/Qwen3-TTS"):
     """
-    使用阿里云 DashScope (Qwen) 的 TTS 接口生成语音。
-    需要设置环境变量 DASHSCOPE_API_KEY。
+    使用本地 Qwen3-TTS 模型生成语音。
+    需要安装: pip install qwen-tts (或从 Qwen3-TTS 源码安装)
     """
-    api_key = os.environ.get("DASHSCOPE_API_KEY")
-    if not api_key:
-        print("[警告] 未设置 DASHSCOPE_API_KEY 环境变量，跳过语音合成。")
-        print("  请设置: export DASHSCOPE_API_KEY='your-api-key'")
-        return False
-
     try:
-        import dashscope
-        from dashscope.audio.tts import SpeechSynthesizer
+        from qwen_tts import QwenTTS
+        import soundfile as sf
 
-        dashscope.api_key = api_key
+        print(f"加载 Qwen3-TTS 模型: {model_path}")
+        tts = QwenTTS(model_path)
 
-        result = SpeechSynthesizer.call(
-            model="sambert-zhichu-v1",
-            text=text,
-            sample_rate=48000,
-            format="wav"
+        print(f"生成语音: {text[:50]}{'...' if len(text) > 50 else ''}")
+        audio, sample_rate = tts.synthesize(text)
+
+        sf.write(output_audio_path, audio, sample_rate)
+        print(f"语音合成完成: {output_audio_path}")
+        return True
+    except ImportError:
+        print("[提示] qwen_tts 包导入失败，尝试使用 transformers 方式加载...")
+        return generate_tts_transformers(text, output_audio_path, model_path)
+    except Exception as e:
+        print(f"[错误] Qwen3-TTS 语音合成失败: {e}")
+        print("[提示] 尝试使用 transformers 方式加载...")
+        return generate_tts_transformers(text, output_audio_path, model_path)
+
+
+def generate_tts_transformers(text, output_audio_path, model_path):
+    """使用 transformers 直接加载 Qwen3-TTS 模型（备选方案）"""
+    try:
+        import torch
+        import soundfile as sf
+        from transformers import AutoTokenizer, AutoModelForCausalLM
+
+        print(f"使用 transformers 加载模型: {model_path}")
+        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            trust_remote_code=True,
+            torch_dtype=torch.float16,
+            device_map="auto"
         )
 
-        if result.get_audio_data() is not None:
-            with open(output_audio_path, "wb") as f:
-                f.write(result.get_audio_data())
-            print(f"语音合成完成: {output_audio_path}")
-            return True
+        print(f"生成语音: {text[:50]}{'...' if len(text) > 50 else ''}")
+        inputs = tokenizer(text, return_tensors="pt").to(model.device)
+        with torch.no_grad():
+            outputs = model.generate(**inputs, max_new_tokens=4096)
+
+        # 解码音频 token 为波形
+        audio = tokenizer.decode_audio(outputs[0])
+        if isinstance(audio, tuple):
+            audio_data, sample_rate = audio
         else:
-            print(f"[错误] 语音合成失败: {result}")
-            return False
-    except ImportError:
-        print("[警告] 未安装 dashscope 库，尝试使用 HTTP API 方式...")
-        return generate_tts_qwen_http(text, output_audio_path, api_key)
+            audio_data = audio
+            sample_rate = 24000
 
-
-def generate_tts_qwen_http(text, output_audio_path, api_key):
-    """使用 HTTP 请求调用 DashScope TTS API (备选方案)"""
-    import urllib.request
-    import urllib.error
-
-    url = "https://dashscope.aliyuncs.com/api/v1/services/aigc/text2audio/generation"
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-    payload = json.dumps({
-        "model": "sambert-zhichu-v1",
-        "input": {"text": text},
-        "parameters": {"sample_rate": 48000, "format": "wav"}
-    }).encode("utf-8")
-
-    req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            # DashScope 可能返回 JSON 或直接音频数据
-            content_type = resp.headers.get("Content-Type", "")
-            data = resp.read()
-
-            if "audio" in content_type:
-                with open(output_audio_path, "wb") as f:
-                    f.write(data)
-                print(f"语音合成完成: {output_audio_path}")
-                return True
-            else:
-                # JSON 响应，解析获取音频 URL
-                result = json.loads(data)
-                audio_url = result.get("output", {}).get("audio", "")
-                if audio_url:
-                    urllib.request.urlretrieve(audio_url, output_audio_path)
-                    print(f"语音合成完成: {output_audio_path}")
-                    return True
-                else:
-                    print(f"[错误] TTS API 返回: {result}")
-                    return False
-    except urllib.error.URLError as e:
-        print(f"[错误] TTS API 请求失败: {e}")
+        sf.write(output_audio_path, audio_data, sample_rate)
+        print(f"语音合成完成: {output_audio_path}")
+        return True
+    except Exception as e:
+        print(f"[错误] transformers 方式也失败了: {e}")
+        print("[提示] 请确认 Qwen3-TTS 模型已正确安装。")
+        print(f"  可尝试: pip install qwen-tts")
+        print(f"  或指定本地模型路径: --tts-model /path/to/Qwen3-TTS")
         return False
 
 
@@ -361,6 +347,8 @@ def main():
     parser.add_argument("--output-dir", default="./output", help="输出目录, 默认 ./output")
     parser.add_argument("--skip-tts", action="store_true", help="跳过语音合成步骤")
     parser.add_argument("--audio-file", default=None, help="直接使用指定的音频文件，跳过TTS")
+    parser.add_argument("--tts-model", default="Qwen/Qwen3-TTS",
+                        help="Qwen3-TTS 模型路径, 默认 Qwen/Qwen3-TTS")
 
     args = parser.parse_args()
 
@@ -421,7 +409,7 @@ def main():
         print(f"\n{'='*60}")
         print("语音合成 (Qwen TTS)")
         print(f"{'='*60}")
-        success = generate_tts_qwen(args.text, audio_path)
+        success = generate_tts_qwen(args.text, audio_path, args.tts_model)
         if not success:
             audio_path = None
     else:

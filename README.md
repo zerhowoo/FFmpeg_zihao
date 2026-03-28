@@ -14,18 +14,14 @@
 
 - Python 3.8+
 - ffmpeg / ffprobe（需系统安装）
-- DashScope API Key（用于 Qwen TTS 语音合成，可选）
+- Qwen3-TTS（本地模型，用于语音合成）
 
 ```bash
-# Ubuntu
+# 安装 ffmpeg
 sudo apt install ffmpeg
 
-# Mac
-brew install ffmpeg
-
-# TTS 依赖（可选）
-pip install dashscope
-export DASHSCOPE_API_KEY='your-api-key'
+# TTS 依赖
+pip install qwen-tts soundfile torch transformers
 ```
 
 ## 使用
@@ -42,6 +38,9 @@ python3 text_to_video.py --text "你的文本" --video-dir ./videos --skip-tts
 
 # 使用已有音频文件
 python3 text_to_video.py --text "你的文本" --video-dir ./videos --audio-file ./audio.wav
+
+# 指定本地 Qwen3-TTS 模型路径
+python3 text_to_video.py --text "你的文本" --video-dir ./videos --tts-model /home/wzh/Qwen3-TTS
 ```
 
 ## 自动裁剪规则
