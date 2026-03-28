@@ -1,29 +1,41 @@
 #!/usr/bin/env python3
 """
-文本转视频生成器 (Text-to-Video Generator)
+视频裁剪拼接工具 (Video Trim & Concat Tool)
 
-Pipeline:
-  文本 → 选择视频素材 → 裁剪拼接 → (人脸处理, 暂不实现) → 语音合成(Qwen) → 合成最终视频
+PyQt5 GUI 工具，支持：
+- 浏览视频文件夹，选择多个视频
+- 裁剪：删掉前后各 x% 的视频，保留中间部分（滑动条设置）
+- 拼接：支持排序、设置输出帧率和分辨率
+- 效果预览
+- 确认输出
 
-Usage:
-  python3 text_to_video.py --text "你的文本内容" --video-dir ./videos --mode auto
-  python3 text_to_video.py --text "你的文本内容" --video-dir ./videos --mode manual
+依赖：
+  pip install PyQt5
+  sudo apt install ffmpeg
 """
 
-import argparse
 import json
 import os
 import subprocess
 import sys
+import tempfile
 import shutil
+
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QPushButton, QLabel, QFileDialog, QListWidget, QListWidgetItem,
+    QSlider, QSpinBox, QComboBox, QGroupBox, QProgressBar,
+    QMessageBox, QAbstractItemView, QSplitter, QGridLayout,
+)
+from PyQt5.QtCore import Qt, QProcess, QThread, pyqtSignal
+from PyQt5.QtGui import QFont
 
 
 # ============================================================
-# 工具函数
+# FFmpeg 工具函数
 # ============================================================
 
 def get_video_duration(video_path):
-    """使用 ffprobe 获取视频时长（秒）"""
     cmd = [
         "ffprobe", "-v", "error",
         "-show_entries", "format=duration",
@@ -34,402 +46,544 @@ def get_video_duration(video_path):
         result = subprocess.run(cmd, capture_output=True, text=True, check=True)
         info = json.loads(result.stdout)
         return float(info["format"]["duration"])
-    except (subprocess.CalledProcessError, KeyError, ValueError) as e:
-        print(f"[错误] 无法获取视频时长: {video_path}\n  {e}")
+    except Exception:
         return None
 
 
-def trim_video(input_path, output_path, start_time, end_time):
-    """使用 ffmpeg 裁剪视频，保留 [start_time, end_time] 区间"""
-    duration = end_time - start_time
+def get_video_info(video_path):
     cmd = [
-        "ffmpeg", "-y",
-        "-ss", str(start_time),
-        "-i", input_path,
-        "-t", str(duration),
-        "-c", "copy",
-        "-avoid_negative_ts", "make_zero",
-        output_path
+        "ffprobe", "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=width,height,r_frame_rate",
+        "-show_entries", "format=duration",
+        "-of", "json",
+        video_path
     ]
-    print(f"  裁剪: {os.path.basename(input_path)} "
-          f"[{start_time:.2f}s - {end_time:.2f}s] -> {os.path.basename(output_path)}")
-    subprocess.run(cmd, capture_output=True, check=True)
-
-
-def concat_videos(video_list, output_path):
-    """使用 ffmpeg concat demuxer 拼接多个视频"""
-    # 创建临时文件列表
-    list_file = output_path + ".filelist.txt"
-    with open(list_file, "w") as f:
-        for v in video_list:
-            # ffmpeg concat 要求路径中的单引号被转义
-            escaped = v.replace("'", "'\\''")
-            f.write(f"file '{escaped}'\n")
-
-    cmd = [
-        "ffmpeg", "-y",
-        "-f", "concat",
-        "-safe", "0",
-        "-i", list_file,
-        "-c", "copy",
-        output_path
-    ]
-    print(f"\n拼接 {len(video_list)} 个视频片段 -> {output_path}")
-    subprocess.run(cmd, capture_output=True, check=True)
-    os.remove(list_file)
-
-
-def merge_video_audio(video_path, audio_path, output_path):
-    """合并视频和音频，以较短的为准"""
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", video_path,
-        "-i", audio_path,
-        "-c:v", "copy",
-        "-c:a", "aac",
-        "-shortest",
-        output_path
-    ]
-    print(f"\n合成最终视频: {output_path}")
-    subprocess.run(cmd, capture_output=True, check=True)
-
-
-# ============================================================
-# 自动裁剪逻辑
-# ============================================================
-
-def calculate_auto_trim(duration):
-    """
-    根据视频时长自动计算裁剪的起止时间。
-    规则:
-      - duration > 15s:  删掉前后各 5s
-      - 10s < duration <= 15s: 删掉前后各 25%
-      - 5s < duration <= 10s: 删掉前后各 (duration - 5) / 2 秒
-      - duration <= 5s: 不处理
-    返回 (start, end) 或 None（不处理）
-    """
-    if duration > 15:
-        return (5.0, duration - 5.0)
-    elif duration > 10:
-        trim = duration * 0.25
-        return (trim, duration - trim)
-    elif duration > 5:
-        trim = (duration - 5) / 2
-        return (trim, duration - trim)
-    else:
-        return None  # 不处理
-
-
-# ============================================================
-# TTS 语音合成 (Qwen3-TTS 本地模型)
-# ============================================================
-
-def generate_tts_qwen(text, output_audio_path, model_path="Qwen/Qwen3-TTS"):
-    """
-    使用本地 Qwen3-TTS 模型生成语音。
-    需要安装: pip install qwen-tts (或从 Qwen3-TTS 源码安装)
-    """
     try:
-        from qwen_tts import QwenTTS
-        import soundfile as sf
-
-        print(f"加载 Qwen3-TTS 模型: {model_path}")
-        tts = QwenTTS(model_path)
-
-        print(f"生成语音: {text[:50]}{'...' if len(text) > 50 else ''}")
-        audio, sample_rate = tts.synthesize(text)
-
-        sf.write(output_audio_path, audio, sample_rate)
-        print(f"语音合成完成: {output_audio_path}")
-        return True
-    except ImportError:
-        print("[提示] qwen_tts 包导入失败，尝试使用 transformers 方式加载...")
-        return generate_tts_transformers(text, output_audio_path, model_path)
-    except Exception as e:
-        print(f"[错误] Qwen3-TTS 语音合成失败: {e}")
-        print("[提示] 尝试使用 transformers 方式加载...")
-        return generate_tts_transformers(text, output_audio_path, model_path)
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        info = json.loads(result.stdout)
+        stream = info.get("streams", [{}])[0]
+        fmt = info.get("format", {})
+        w = stream.get("width", 0)
+        h = stream.get("height", 0)
+        rfr = stream.get("r_frame_rate", "30/1")
+        num, den = rfr.split("/")
+        fps = round(int(num) / max(int(den), 1), 2)
+        dur = float(fmt.get("duration", 0))
+        return {"width": w, "height": h, "fps": fps, "duration": dur}
+    except Exception:
+        return {"width": 0, "height": 0, "fps": 0, "duration": 0}
 
 
-def generate_tts_transformers(text, output_audio_path, model_path):
-    """使用 transformers 直接加载 Qwen3-TTS 模型（备选方案）"""
-    try:
-        import torch
-        import soundfile as sf
-        from transformers import AutoTokenizer, AutoModelForCausalLM
-
-        print(f"使用 transformers 加载模型: {model_path}")
-        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-        model = AutoModelForCausalLM.from_pretrained(
-            model_path,
-            trust_remote_code=True,
-            torch_dtype=torch.float16,
-            device_map="auto"
-        )
-
-        print(f"生成语音: {text[:50]}{'...' if len(text) > 50 else ''}")
-        inputs = tokenizer(text, return_tensors="pt").to(model.device)
-        with torch.no_grad():
-            outputs = model.generate(**inputs, max_new_tokens=4096)
-
-        # 解码音频 token 为波形
-        audio = tokenizer.decode_audio(outputs[0])
-        if isinstance(audio, tuple):
-            audio_data, sample_rate = audio
-        else:
-            audio_data = audio
-            sample_rate = 24000
-
-        sf.write(output_audio_path, audio_data, sample_rate)
-        print(f"语音合成完成: {output_audio_path}")
-        return True
-    except Exception as e:
-        print(f"[错误] transformers 方式也失败了: {e}")
-        print("[提示] 请确认 Qwen3-TTS 模型已正确安装。")
-        print(f"  可尝试: pip install qwen-tts")
-        print(f"  或指定本地模型路径: --tts-model /path/to/Qwen3-TTS")
-        return False
+def format_time(seconds):
+    m, s = divmod(int(seconds), 60)
+    h, m = divmod(m, 60)
+    if h > 0:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m}:{s:02d}"
 
 
 # ============================================================
-# 主流程
+# 后台处理线程
 # ============================================================
 
-def list_videos(video_dir):
-    """列出目录下所有视频文件"""
-    video_exts = {".mp4", ".avi", ".mov", ".mkv", ".flv", ".wmv", ".webm", ".ts", ".m4v"}
-    videos = []
-    for f in sorted(os.listdir(video_dir)):
-        ext = os.path.splitext(f)[1].lower()
-        if ext in video_exts:
-            videos.append(os.path.join(video_dir, f))
-    return videos
+class ProcessThread(QThread):
+    progress = pyqtSignal(int, str)  # percent, message
+    finished = pyqtSignal(bool, str)  # success, message
 
+    def __init__(self, video_items, trim_pct, fps, width, height, output_path):
+        super().__init__()
+        self.video_items = video_items  # list of file paths in order
+        self.trim_pct = trim_pct
+        self.fps = fps
+        self.width = width
+        self.height = height
+        self.output_path = output_path
 
-def interactive_select_videos(video_dir):
-    """交互式选择视频素材"""
-    videos = list_videos(video_dir)
-    if not videos:
-        print(f"[错误] 视频目录中没有找到视频文件: {video_dir}")
-        sys.exit(1)
-
-    print(f"\n{'='*60}")
-    print(f"视频库: {video_dir}")
-    print(f"{'='*60}")
-    for i, v in enumerate(videos):
-        dur = get_video_duration(v)
-        dur_str = f"{dur:.1f}s" if dur else "未知"
-        print(f"  [{i}] {os.path.basename(v)}  ({dur_str})")
-
-    print(f"\n请输入要选择的视频编号（用逗号或空格分隔，按顺序排列）:")
-    print(f"例如: 0,2,5 或 0 2 5")
-    selection = input("> ").strip()
-
-    indices = []
-    for part in selection.replace(",", " ").split():
+    def run(self):
         try:
-            idx = int(part.strip())
-            if 0 <= idx < len(videos):
-                indices.append(idx)
-            else:
-                print(f"  [警告] 忽略无效编号: {idx}")
-        except ValueError:
-            print(f"  [警告] 忽略无效输入: {part}")
+            tmpdir = tempfile.mkdtemp(prefix="vtool_")
+            total = len(self.video_items)
+            trimmed_files = []
 
-    if not indices:
-        print("[错误] 没有选择任何视频")
-        sys.exit(1)
-
-    selected = [videos[i] for i in indices]
-    print(f"\n已选择 {len(selected)} 个视频:")
-    for v in selected:
-        print(f"  - {os.path.basename(v)}")
-    return selected
-
-
-def process_auto_mode(selected_videos, output_dir):
-    """自动模式：根据时长规则裁剪视频"""
-    print(f"\n{'='*60}")
-    print("自动裁剪模式")
-    print(f"{'='*60}")
-
-    processed = []
-    for video_path in selected_videos:
-        duration = get_video_duration(video_path)
-        if duration is None:
-            print(f"  [跳过] 无法获取时长: {os.path.basename(video_path)}")
-            continue
-
-        basename = os.path.splitext(os.path.basename(video_path))[0]
-        out_name = f"{basename}_trimmed.mp4"
-        out_path = os.path.join(output_dir, out_name)
-
-        trim_range = calculate_auto_trim(duration)
-        if trim_range is None:
-            # 时长 <= 5s，直接复制
-            print(f"  {os.path.basename(video_path)} ({duration:.1f}s <= 5s): 不裁剪，直接使用")
-            shutil.copy2(video_path, out_path)
-        else:
-            start, end = trim_range
-            print(f"  {os.path.basename(video_path)} ({duration:.1f}s): "
-                  f"裁剪 [{start:.2f}s - {end:.2f}s]")
-            trim_video(video_path, out_path, start, end)
-
-        processed.append(out_path)
-
-    return processed
-
-
-def process_manual_mode(selected_videos, output_dir):
-    """手动模式：用户指定每个视频的裁剪起止时间"""
-    print(f"\n{'='*60}")
-    print("手动裁剪模式")
-    print(f"{'='*60}")
-
-    processed = []
-    for video_path in selected_videos:
-        duration = get_video_duration(video_path)
-        dur_str = f" (时长: {duration:.1f}s)" if duration else ""
-        name = os.path.basename(video_path)
-
-        print(f"\n视频: {name}{dur_str}")
-        print(f"  请输入两刀的位置（秒），用逗号分隔，只保留中间部分。")
-        print(f"  例如: 3,12  表示保留 3s 到 12s 的内容")
-        print(f"  直接回车跳过（不裁剪，直接使用原视频）")
-
-        user_input = input("  > ").strip()
-
-        basename = os.path.splitext(name)[0]
-        out_name = f"{basename}_trimmed.mp4"
-        out_path = os.path.join(output_dir, out_name)
-
-        if not user_input:
-            print(f"  -> 不裁剪，直接使用")
-            shutil.copy2(video_path, out_path)
-        else:
-            try:
-                parts = user_input.split(",")
-                start = float(parts[0].strip())
-                end = float(parts[1].strip())
-                if start >= end:
-                    print(f"  [错误] 起始时间必须小于结束时间，跳过此视频")
+            # Step 1: 裁剪每个视频
+            for i, video_path in enumerate(self.video_items):
+                self.progress.emit(
+                    int((i / total) * 60),
+                    f"裁剪中 ({i+1}/{total}): {os.path.basename(video_path)}"
+                )
+                out_file = os.path.join(tmpdir, f"trimmed_{i:04d}.mp4")
+                duration = get_video_duration(video_path)
+                if duration is None or duration <= 0:
                     continue
-                trim_video(video_path, out_path, start, end)
-            except (ValueError, IndexError):
-                print(f"  [错误] 输入格式不正确，跳过此视频")
-                continue
 
-        processed.append(out_path)
+                trim_sec = duration * self.trim_pct / 100.0
+                start = trim_sec
+                end = duration - trim_sec
 
-    return processed
+                if start >= end:
+                    # trim 太多，跳过
+                    continue
 
+                cmd = [
+                    "ffmpeg", "-y",
+                    "-ss", str(start),
+                    "-i", video_path,
+                    "-t", str(end - start),
+                    "-vf", f"scale={self.width}:{self.height}:force_original_aspect_ratio=decrease,"
+                           f"pad={self.width}:{self.height}:(ow-iw)/2:(oh-ih)/2:black",
+                    "-r", str(self.fps),
+                    "-c:v", "libx264",
+                    "-preset", "fast",
+                    "-c:a", "aac",
+                    "-ar", "44100",
+                    "-ac", "2",
+                    out_file
+                ]
+                subprocess.run(cmd, capture_output=True, check=True)
+                trimmed_files.append(out_file)
+
+            if not trimmed_files:
+                self.finished.emit(False, "没有可处理的视频片段")
+                return
+
+            # Step 2: 拼接
+            self.progress.emit(70, "拼接视频中...")
+            list_file = os.path.join(tmpdir, "filelist.txt")
+            with open(list_file, "w") as f:
+                for tf in trimmed_files:
+                    f.write(f"file '{tf}'\n")
+
+            cmd = [
+                "ffmpeg", "-y",
+                "-f", "concat",
+                "-safe", "0",
+                "-i", list_file,
+                "-c", "copy",
+                self.output_path
+            ]
+            subprocess.run(cmd, capture_output=True, check=True)
+
+            # 清理临时文件
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+            self.progress.emit(100, "完成!")
+            self.finished.emit(True, f"输出: {self.output_path}")
+
+        except subprocess.CalledProcessError as e:
+            stderr = e.stderr.decode() if e.stderr else str(e)
+            self.finished.emit(False, f"FFmpeg 错误:\n{stderr[-500:]}")
+        except Exception as e:
+            self.finished.emit(False, f"错误: {str(e)}")
+
+
+# ============================================================
+# 预览线程 (生成单个裁剪后的预览)
+# ============================================================
+
+class PreviewThread(QThread):
+    finished = pyqtSignal(bool, str)  # success, preview_file_path or error
+
+    def __init__(self, video_path, trim_pct):
+        super().__init__()
+        self.video_path = video_path
+        self.trim_pct = trim_pct
+
+    def run(self):
+        try:
+            duration = get_video_duration(self.video_path)
+            if duration is None:
+                self.finished.emit(False, "无法获取视频时长")
+                return
+
+            trim_sec = duration * self.trim_pct / 100.0
+            start = trim_sec
+            end = duration - trim_sec
+
+            if start >= end:
+                self.finished.emit(False, "裁剪比例过大，无可用片段")
+                return
+
+            preview_file = tempfile.mktemp(suffix=".mp4", prefix="preview_")
+            cmd = [
+                "ffmpeg", "-y",
+                "-ss", str(start),
+                "-i", self.video_path,
+                "-t", str(end - start),
+                "-c:v", "libx264",
+                "-preset", "ultrafast",
+                "-c:a", "aac",
+                preview_file
+            ]
+            subprocess.run(cmd, capture_output=True, check=True)
+            self.finished.emit(True, preview_file)
+        except Exception as e:
+            self.finished.emit(False, str(e))
+
+
+# ============================================================
+# 主窗口
+# ============================================================
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("视频裁剪拼接工具")
+        self.setMinimumSize(900, 650)
+
+        self.video_folder = ""
+        self.output_path = ""
+        self.process_thread = None
+        self.preview_thread = None
+
+        self.init_ui()
+
+    def init_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        main_layout = QVBoxLayout(central)
+
+        # ---- 输入文件夹 ----
+        input_group = QGroupBox("视频源文件夹")
+        input_layout = QHBoxLayout(input_group)
+        self.folder_label = QLabel("未选择")
+        self.folder_label.setStyleSheet("color: gray;")
+        btn_browse_input = QPushButton("Browse...")
+        btn_browse_input.setFixedWidth(100)
+        btn_browse_input.clicked.connect(self.browse_input_folder)
+        input_layout.addWidget(self.folder_label, 1)
+        input_layout.addWidget(btn_browse_input)
+        main_layout.addWidget(input_group)
+
+        # ---- 中间区域: 左侧视频列表 + 右侧已选列表 ----
+        splitter = QSplitter(Qt.Horizontal)
+
+        # 左: 文件夹内视频
+        left_group = QGroupBox("可选视频")
+        left_layout = QVBoxLayout(left_group)
+        self.video_list = QListWidget()
+        self.video_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        left_layout.addWidget(self.video_list)
+        btn_add = QPushButton("添加选中 >>")
+        btn_add.clicked.connect(self.add_selected)
+        left_layout.addWidget(btn_add)
+        splitter.addWidget(left_group)
+
+        # 右: 已选视频（拼接顺序）
+        right_group = QGroupBox("拼接队列（从上到下）")
+        right_layout = QVBoxLayout(right_group)
+        self.queue_list = QListWidget()
+        self.queue_list.setDragDropMode(QAbstractItemView.InternalMove)
+        self.queue_list.currentRowChanged.connect(self.on_queue_selection_changed)
+        right_layout.addWidget(self.queue_list)
+
+        queue_btn_layout = QHBoxLayout()
+        btn_up = QPushButton("上移 ↑")
+        btn_up.clicked.connect(self.move_up)
+        btn_down = QPushButton("下移 ↓")
+        btn_down.clicked.connect(self.move_down)
+        btn_remove = QPushButton("移除")
+        btn_remove.clicked.connect(self.remove_selected)
+        queue_btn_layout.addWidget(btn_up)
+        queue_btn_layout.addWidget(btn_down)
+        queue_btn_layout.addWidget(btn_remove)
+        right_layout.addLayout(queue_btn_layout)
+        splitter.addWidget(right_group)
+
+        splitter.setSizes([400, 400])
+        main_layout.addWidget(splitter)
+
+        # ---- 设置区域 ----
+        settings_layout = QHBoxLayout()
+
+        # 裁剪设置
+        trim_group = QGroupBox("裁剪设置")
+        trim_layout = QGridLayout(trim_group)
+
+        trim_layout.addWidget(QLabel("删掉前后各:"), 0, 0)
+        self.trim_slider = QSlider(Qt.Horizontal)
+        self.trim_slider.setRange(0, 50)
+        self.trim_slider.setValue(0)
+        self.trim_slider.setTickPosition(QSlider.TicksBelow)
+        self.trim_slider.setTickInterval(5)
+        self.trim_slider.valueChanged.connect(self.on_trim_changed)
+        trim_layout.addWidget(self.trim_slider, 0, 1)
+
+        self.trim_label = QLabel("0%")
+        self.trim_label.setFixedWidth(50)
+        self.trim_label.setAlignment(Qt.AlignCenter)
+        font = QFont()
+        font.setBold(True)
+        self.trim_label.setFont(font)
+        trim_layout.addWidget(self.trim_label, 0, 2)
+
+        self.trim_info_label = QLabel("")
+        self.trim_info_label.setStyleSheet("color: #555;")
+        trim_layout.addWidget(self.trim_info_label, 1, 0, 1, 3)
+
+        settings_layout.addWidget(trim_group)
+
+        # 输出设置
+        output_group = QGroupBox("输出设置")
+        out_layout = QGridLayout(output_group)
+
+        out_layout.addWidget(QLabel("帧率 (FPS):"), 0, 0)
+        self.fps_spin = QSpinBox()
+        self.fps_spin.setRange(1, 120)
+        self.fps_spin.setValue(30)
+        out_layout.addWidget(self.fps_spin, 0, 1)
+
+        out_layout.addWidget(QLabel("分辨率:"), 1, 0)
+        self.resolution_combo = QComboBox()
+        self.resolution_combo.addItems([
+            "1920x1080 (1080p)",
+            "1280x720 (720p)",
+            "3840x2160 (4K)",
+            "854x480 (480p)",
+            "640x360 (360p)",
+        ])
+        self.resolution_combo.setCurrentIndex(0)
+        out_layout.addWidget(self.resolution_combo, 1, 1)
+
+        settings_layout.addWidget(output_group)
+        main_layout.addLayout(settings_layout)
+
+        # ---- 操作按钮 ----
+        action_layout = QHBoxLayout()
+
+        btn_preview = QPushButton("效果预览")
+        btn_preview.setFixedHeight(40)
+        btn_preview.clicked.connect(self.preview)
+        action_layout.addWidget(btn_preview)
+
+        # 输出路径
+        self.output_label = QLabel("未选择输出路径")
+        self.output_label.setStyleSheet("color: gray;")
+        action_layout.addWidget(self.output_label, 1)
+
+        btn_browse_output = QPushButton("输出路径...")
+        btn_browse_output.clicked.connect(self.browse_output)
+        action_layout.addWidget(btn_browse_output)
+
+        btn_export = QPushButton("确认输出")
+        btn_export.setFixedHeight(40)
+        btn_export.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold;")
+        btn_export.clicked.connect(self.export_video)
+        action_layout.addWidget(btn_export)
+
+        main_layout.addLayout(action_layout)
+
+        # ---- 进度条 ----
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(False)
+        main_layout.addWidget(self.progress_bar)
+
+        self.status_label = QLabel("")
+        main_layout.addWidget(self.status_label)
+
+    # ---- 浏览文件夹 ----
+    def browse_input_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "选择视频文件夹")
+        if not folder:
+            return
+        self.video_folder = folder
+        self.folder_label.setText(folder)
+        self.folder_label.setStyleSheet("")
+        self.load_videos(folder)
+
+    def load_videos(self, folder):
+        self.video_list.clear()
+        exts = {".mp4", ".avi", ".mov", ".mkv", ".flv", ".wmv", ".webm", ".ts", ".m4v"}
+        for f in sorted(os.listdir(folder)):
+            ext = os.path.splitext(f)[1].lower()
+            if ext in exts:
+                filepath = os.path.join(folder, f)
+                info = get_video_info(filepath)
+                dur_str = format_time(info["duration"]) if info["duration"] > 0 else "?"
+                res_str = f"{info['width']}x{info['height']}" if info["width"] > 0 else "?"
+                label = f"{f}  [{dur_str} | {res_str} | {info['fps']}fps]"
+                item = QListWidgetItem(label)
+                item.setData(Qt.UserRole, filepath)
+                self.video_list.addItem(item)
+
+    # ---- 添加/移除/排序 ----
+    def add_selected(self):
+        for item in self.video_list.selectedItems():
+            filepath = item.data(Qt.UserRole)
+            # 避免重复
+            exists = False
+            for i in range(self.queue_list.count()):
+                if self.queue_list.item(i).data(Qt.UserRole) == filepath:
+                    exists = True
+                    break
+            if not exists:
+                new_item = QListWidgetItem(item.text())
+                new_item.setData(Qt.UserRole, filepath)
+                self.queue_list.addItem(new_item)
+
+    def remove_selected(self):
+        for item in self.queue_list.selectedItems():
+            self.queue_list.takeItem(self.queue_list.row(item))
+
+    def move_up(self):
+        row = self.queue_list.currentRow()
+        if row > 0:
+            item = self.queue_list.takeItem(row)
+            self.queue_list.insertItem(row - 1, item)
+            self.queue_list.setCurrentRow(row - 1)
+
+    def move_down(self):
+        row = self.queue_list.currentRow()
+        if row < self.queue_list.count() - 1:
+            item = self.queue_list.takeItem(row)
+            self.queue_list.insertItem(row + 1, item)
+            self.queue_list.setCurrentRow(row + 1)
+
+    # ---- 裁剪滑动条 ----
+    def on_trim_changed(self, value):
+        self.trim_label.setText(f"{value}%")
+        self.update_trim_info()
+
+    def on_queue_selection_changed(self):
+        self.update_trim_info()
+
+    def update_trim_info(self):
+        row = self.queue_list.currentRow()
+        pct = self.trim_slider.value()
+        if row < 0 or row >= self.queue_list.count():
+            if pct == 0:
+                self.trim_info_label.setText("不裁剪")
+            else:
+                self.trim_info_label.setText(f"前后各删 {pct}%，保留中间 {100 - 2*pct}%")
+            return
+
+        filepath = self.queue_list.item(row).data(Qt.UserRole)
+        dur = get_video_duration(filepath)
+        if dur and dur > 0:
+            trim_sec = dur * pct / 100.0
+            keep = dur - 2 * trim_sec
+            self.trim_info_label.setText(
+                f"当前选中: {os.path.basename(filepath)} | "
+                f"原长 {format_time(dur)} → 保留 {format_time(max(keep, 0))} "
+                f"(前后各删 {trim_sec:.1f}s)"
+            )
+        else:
+            self.trim_info_label.setText(f"前后各删 {pct}%，保留中间 {100 - 2*pct}%")
+
+    # ---- 输出路径 ----
+    def browse_output(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "选择输出路径", "", "MP4 (*.mp4);;All Files (*)"
+        )
+        if path:
+            if not path.lower().endswith(".mp4"):
+                path += ".mp4"
+            self.output_path = path
+            self.output_label.setText(path)
+            self.output_label.setStyleSheet("")
+
+    # ---- 解析分辨率 ----
+    def get_resolution(self):
+        text = self.resolution_combo.currentText()
+        res = text.split(" ")[0]
+        w, h = res.split("x")
+        return int(w), int(h)
+
+    # ---- 获取队列中的视频路径列表 ----
+    def get_queue_paths(self):
+        paths = []
+        for i in range(self.queue_list.count()):
+            paths.append(self.queue_list.item(i).data(Qt.UserRole))
+        return paths
+
+    # ---- 效果预览 ----
+    def preview(self):
+        row = self.queue_list.currentRow()
+        if row < 0:
+            QMessageBox.warning(self, "提示", "请先在拼接队列中选择一个视频进行预览")
+            return
+
+        filepath = self.queue_list.item(row).data(Qt.UserRole)
+        pct = self.trim_slider.value()
+
+        self.status_label.setText("正在生成预览...")
+        self.preview_thread = PreviewThread(filepath, pct)
+        self.preview_thread.finished.connect(self.on_preview_done)
+        self.preview_thread.start()
+
+    def on_preview_done(self, success, result):
+        if success:
+            self.status_label.setText(f"预览已生成，正在播放...")
+            # 用系统默认播放器打开
+            if sys.platform == "linux":
+                subprocess.Popen(["xdg-open", result])
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", result])
+            else:
+                os.startfile(result)
+        else:
+            self.status_label.setText("")
+            QMessageBox.warning(self, "预览失败", result)
+
+    # ---- 确认输出 ----
+    def export_video(self):
+        paths = self.get_queue_paths()
+        if not paths:
+            QMessageBox.warning(self, "提示", "拼接队列为空，请先添加视频")
+            return
+
+        if not self.output_path:
+            QMessageBox.warning(self, "提示", "请先选择输出路径")
+            return
+
+        if self.process_thread and self.process_thread.isRunning():
+            QMessageBox.warning(self, "提示", "正在处理中，请等待完成")
+            return
+
+        w, h = self.get_resolution()
+        fps = self.fps_spin.value()
+        trim_pct = self.trim_slider.value()
+
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)
+
+        self.process_thread = ProcessThread(
+            paths, trim_pct, fps, w, h, self.output_path
+        )
+        self.process_thread.progress.connect(self.on_process_progress)
+        self.process_thread.finished.connect(self.on_process_done)
+        self.process_thread.start()
+
+    def on_process_progress(self, pct, msg):
+        self.progress_bar.setValue(pct)
+        self.status_label.setText(msg)
+
+    def on_process_done(self, success, msg):
+        self.progress_bar.setValue(100 if success else 0)
+        if success:
+            self.status_label.setText(msg)
+            QMessageBox.information(self, "完成", msg)
+        else:
+            self.status_label.setText("处理失败")
+            QMessageBox.critical(self, "错误", msg)
+        self.progress_bar.setVisible(False)
+
+
+# ============================================================
+# 入口
+# ============================================================
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="文本转视频生成器 - Text to Video Generator",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-示例:
-  # 自动模式
-  python3 text_to_video.py --text "今天天气真好" --video-dir ./videos --mode auto
-
-  # 手动模式
-  python3 text_to_video.py --text "今天天气真好" --video-dir ./videos --mode manual
-
-  # 指定输出目录
-  python3 text_to_video.py --text "今天天气真好" --video-dir ./videos --mode auto --output-dir ./output
-        """
-    )
-    parser.add_argument("--text", required=True, help="要转换为视频的文本内容")
-    parser.add_argument("--video-dir", required=True, help="视频素材库目录路径")
-    parser.add_argument("--mode", choices=["auto", "manual"], default="auto",
-                        help="裁剪模式: auto(自动) 或 manual(手动), 默认 auto")
-    parser.add_argument("--output-dir", default="./output", help="输出目录, 默认 ./output")
-    parser.add_argument("--skip-tts", action="store_true", help="跳过语音合成步骤")
-    parser.add_argument("--audio-file", default=None, help="直接使用指定的音频文件，跳过TTS")
-    parser.add_argument("--tts-model", default="Qwen/Qwen3-TTS",
-                        help="Qwen3-TTS 模型路径, 默认 Qwen/Qwen3-TTS")
-
-    args = parser.parse_args()
-
-    # 检查 ffmpeg
     if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
-        print("[错误] 未找到 ffmpeg/ffprobe，请先安装 ffmpeg。")
-        print("  Ubuntu: sudo apt install ffmpeg")
-        print("  Mac: brew install ffmpeg")
+        print("[错误] 未找到 ffmpeg/ffprobe，请先安装: sudo apt install ffmpeg")
         sys.exit(1)
 
-    # 检查视频目录
-    if not os.path.isdir(args.video_dir):
-        print(f"[错误] 视频目录不存在: {args.video_dir}")
-        sys.exit(1)
-
-    # 创建输出目录
-    processed_dir = os.path.join(args.output_dir, "processed")
-    os.makedirs(processed_dir, exist_ok=True)
-
-    print(f"\n文本内容: {args.text}")
-    print(f"裁剪模式: {'自动' if args.mode == 'auto' else '手动'}")
-
-    # ---- Step 1: 选择视频素材 ----
-    selected_videos = interactive_select_videos(args.video_dir)
-
-    # ---- Step 2: 裁剪处理 ----
-    if args.mode == "auto":
-        processed_videos = process_auto_mode(selected_videos, processed_dir)
-    else:
-        processed_videos = process_manual_mode(selected_videos, processed_dir)
-
-    if not processed_videos:
-        print("\n[错误] 没有成功处理任何视频")
-        sys.exit(1)
-
-    print(f"\n处理完成的视频素材已保存到: {processed_dir}")
-    for v in processed_videos:
-        print(f"  - {os.path.basename(v)}")
-
-    # ---- Step 3: 拼接所有处理后的视频 ----
-    concat_output = os.path.join(args.output_dir, "concatenated.mp4")
-    if len(processed_videos) == 1:
-        shutil.copy2(processed_videos[0], concat_output)
-        print(f"\n只有一个视频片段，直接使用: {concat_output}")
-    else:
-        concat_videos(processed_videos, concat_output)
-
-    # ---- Step 4: 语音合成 (Qwen TTS) ----
-    audio_path = None
-    if args.audio_file:
-        if os.path.isfile(args.audio_file):
-            audio_path = args.audio_file
-            print(f"\n使用指定音频文件: {audio_path}")
-        else:
-            print(f"[错误] 指定的音频文件不存在: {args.audio_file}")
-    elif not args.skip_tts:
-        audio_path = os.path.join(args.output_dir, "tts_audio.wav")
-        print(f"\n{'='*60}")
-        print("语音合成 (Qwen TTS)")
-        print(f"{'='*60}")
-        success = generate_tts_qwen(args.text, audio_path, args.tts_model)
-        if not success:
-            audio_path = None
-    else:
-        print("\n已跳过语音合成步骤。")
-
-    # ---- Step 5: 合成最终视频 ----
-    final_output = os.path.join(args.output_dir, "final_video.mp4")
-    if audio_path and os.path.isfile(audio_path):
-        merge_video_audio(concat_output, audio_path, final_output)
-        print(f"\n{'='*60}")
-        print(f"最终视频已生成: {final_output}")
-        print(f"{'='*60}")
-    else:
-        # 没有音频，拼接后的视频即为最终视频
-        shutil.copy2(concat_output, final_output)
-        print(f"\n{'='*60}")
-        print(f"最终视频（无语音）: {final_output}")
-        print(f"{'='*60}")
-
-    print("\n完成!")
+    app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec_())
 
 
 if __name__ == "__main__":
